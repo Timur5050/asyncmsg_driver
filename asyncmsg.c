@@ -8,7 +8,7 @@ static int asyncmsg_major = 0;
 
 static int culc_free_space(struct asyncmsg_dev *dev)
 {
-    return MAX_QUEUE_SIZE - dev->tail;
+    return (dev->tail < MAX_QUEUE_SIZE) ? (MAX_QUEUE_SIZE - dev->tail) : 0;
 }
 
 static int asyncmsg_open(struct inode *inode, struct file *filp)
@@ -38,9 +38,10 @@ static ssize_t asyncmsg_read(struct file *file, char __user *buf, size_t count, 
     struct asyncmsg_dev *dev = file->private_data;
     int len;
 
-
     if (*ppos > 0)
+    {
         return 0;
+    }
 
     int ret = wait_event_timeout(dev->read_q, dev->free_messages > 0, msecs_to_jiffies(15000));
     if(ret == 0)
@@ -52,8 +53,16 @@ static ssize_t asyncmsg_read(struct file *file, char __user *buf, size_t count, 
         return -EFAULT;
     }
 
+    if(down_interruptible(&dev->sem))
+    {
+        return -ERESTARTSYS;
+    }
+
     if (dev->head >= dev->tail)
+    {
+        up(&dev->sem);
         return 0;
+    }   
 
     struct async_msg *curr_msg = &dev->queue[dev->head];
     curr_msg->processed = true;
@@ -69,20 +78,31 @@ static ssize_t asyncmsg_read(struct file *file, char __user *buf, size_t count, 
                 curr_msg->processed);
 
     if (copy_to_user(buf, tmp, len))
+    {
+        up(&dev->sem);
         return -EFAULT;
+    }
 
     dev->head++;
     dev->free_messages--;
     *ppos += len;
+    up(&dev->sem);
     wake_up(&dev->write_q);
+    
     return len;
-
 }
 
 static ssize_t asyncmsg_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
 {
     char tmp[MAX_MSG_LEN];
     struct asyncmsg_dev *dev = file->private_data;
+
+    if (dev->tail >= MAX_QUEUE_SIZE)
+    {
+        up(&dev->sem);
+        return -ENOSPC;
+    }
+
 
     int ret = wait_event_timeout(dev->write_q, culc_free_space(dev) > 0, msecs_to_jiffies(15000));
     if(ret == 0)
@@ -94,9 +114,15 @@ static ssize_t asyncmsg_write(struct file *file, const char __user *buf, size_t 
         return -EFAULT;
     }
 
+    if(down_interruptible(&dev->sem))
+    {
+        return -ERESTARTSYS;
+    }
+
     count = min((size_t)MAX_MSG_LEN, count);
     if(copy_from_user(tmp, buf, count))
     {
+        up(&dev->sem);
         return -EFAULT;
     }   
 
@@ -107,14 +133,14 @@ static ssize_t asyncmsg_write(struct file *file, const char __user *buf, size_t 
     new_mess.len = count;
     new_mess.processed = false;
     
-    if(dev->tail < MAX_QUEUE_SIZE - 1)
-    {
-        dev->queue[dev->tail] = new_mess;
-        dev->tail++;
-        dev->free_messages++;
-    }
+
+    dev->queue[dev->tail] = new_mess;
+    dev->tail++;
+    dev->free_messages++;
+
     printk(KERN_INFO "asyncmsg: write message with len %d\n", count);
     wake_up(&dev->read_q);
+    up(&dev->sem);
 
     return count;
 }
