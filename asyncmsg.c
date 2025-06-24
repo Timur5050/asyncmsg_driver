@@ -6,6 +6,8 @@ static dev_t asyncmsg_devno;
 static struct class *asyncmsg_class;
 static int asyncmsg_major = 0;
 
+static void asyncmsg_timer_fn(struct timer_list *t);
+
 static int culc_free_space(struct asyncmsg_dev *dev)
 {
     return (dev->tail < MAX_QUEUE_SIZE) ? (MAX_QUEUE_SIZE - dev->tail) : 0;
@@ -14,21 +16,25 @@ static int culc_free_space(struct asyncmsg_dev *dev)
 static int asyncmsg_open(struct inode *inode, struct file *filp)
 {
     filp->private_data = &asyncmsg_dev;
-    spin_lock_irq(&asyncmsg_dev.lock);
+    unsigned long flags;
+
+    spin_lock_irqsave(&asyncmsg_dev.lock, flags);
     asyncmsg_dev.open_count++;
     printk(KERN_INFO "asyncmsg: opened device, major=%d, minor=%d\n",
         MAJOR(inode->i_rdev), MINOR(inode->i_rdev));
-    spin_unlock_irq(&asyncmsg_dev.lock);
+    spin_unlock_irqrestore(&asyncmsg_dev.lock, flags);
     return 0;
 }
 
 static int asyncmsg_release(struct inode *inode, struct file *file)
 {
-    spin_lock_irq(&asyncmsg_dev.lock);
+    unsigned long flags;
+
+    spin_lock_irqsave(&asyncmsg_dev.lock, flags);
     asyncmsg_dev.open_count--;
     printk(KERN_INFO "asyncmsg: released device, major=%d, minor=%d\n",
             MAJOR(inode->i_rdev), MINOR(inode->i_rdev));
-    spin_unlock_irq(&asyncmsg_dev.lock);  
+    spin_unlock_irqrestore(&asyncmsg_dev.lock, flags);  
     return 0;
 }
 
@@ -43,7 +49,7 @@ static ssize_t asyncmsg_read(struct file *file, char __user *buf, size_t count, 
         return 0;
     }
 
-    int ret = wait_event_timeout(dev->read_q, dev->free_messages > 0, msecs_to_jiffies(15000));
+    int ret = wait_event_interruptible_timeout(dev->read_q, dev->free_messages > 0, msecs_to_jiffies(15000));
     if(ret == 0)
     {
         return 0;
@@ -103,8 +109,7 @@ static ssize_t asyncmsg_write(struct file *file, const char __user *buf, size_t 
         return -ENOSPC;
     }
 
-
-    int ret = wait_event_timeout(dev->write_q, culc_free_space(dev) > 0, msecs_to_jiffies(15000));
+    int ret = wait_event_interruptible_timeout(dev->write_q, culc_free_space(dev) > 0, msecs_to_jiffies(15000));
     if(ret == 0)
     {
         return 0;
@@ -145,6 +150,29 @@ static ssize_t asyncmsg_write(struct file *file, const char __user *buf, size_t 
     return count;
 }
 
+static void asyncmsg_timer_fn(struct timer_list *t)
+{
+    struct asyncmsg_dev *dev = from_timer(dev, t, stat_timer);
+    unsigned long flags;
+
+    spin_lock_irqsave(&dev->lock, flags);
+    printk(KERN_INFO  "asyncmsg: "
+                        "head position: %d\n"
+                        "tail position: %d\n"
+                        "free messages: %d\n"
+                        "open count: %d\n"
+                        "write delay ms: %d\n",
+                        dev->head, 
+                        dev->tail,
+                        dev->free_messages,
+                        dev->open_count,
+                        dev->write_delay_ms);
+    spin_unlock_irqrestore(&dev->lock, flags);
+
+    mod_timer(&dev->stat_timer, jiffies + msecs_to_jiffies(10000));
+}
+
+
 static struct file_operations asyncmsg_fops = {
     .owner = THIS_MODULE,
     .open = asyncmsg_open,
@@ -175,7 +203,9 @@ static int __init asyncmsg_init(void)
     init_waitqueue_head (&asyncmsg_dev.read_q);
     init_waitqueue_head(&asyncmsg_dev.write_q);
 
-    // timer_setup(&asyncmsg_dev.stat_timer, asyncmsg_timer_fn, 0);
+    timer_setup(&asyncmsg_dev.stat_timer, asyncmsg_timer_fn, 0);
+    mod_timer(&asyncmsg_dev.stat_timer, jiffies + msecs_to_jiffies(10000));
+
     // mod_timer(&asyncmsg_dev.stat_timer, jiffies + msecs_to_jiffies(10000));
     // tasklet_init(&asyncmsg_dev.tasklet, asyncmsg_tasklet_fn, (unsigned long)&asyncmsg_dev);
     asyncmsg_dev.wq = create_singlethread_workqueue("asyncmsg_wq");
