@@ -38,13 +38,19 @@ static ssize_t asyncmsg_read(struct file *file, char __user *buf, size_t count, 
     struct asyncmsg_dev *dev = file->private_data;
     int len;
 
-    if(dev->free_messages == 0)
+
+    if (*ppos > 0)
+        return 0;
+
+    int ret = wait_event_timeout(dev->read_q, dev->free_messages > 0, msecs_to_jiffies(15000));
+    if(ret == 0)
     {
         return 0;
     }
-
-   if (*ppos > 0)
-    return 0;
+    else if(ret < 0)
+    {
+        return -EFAULT;
+    }
 
     if (dev->head >= dev->tail)
         return 0;
@@ -68,7 +74,7 @@ static ssize_t asyncmsg_read(struct file *file, char __user *buf, size_t count, 
     dev->head++;
     dev->free_messages--;
     *ppos += len;
-
+    wake_up(&dev->write_q);
     return len;
 
 }
@@ -77,7 +83,13 @@ static ssize_t asyncmsg_write(struct file *file, const char __user *buf, size_t 
 {
     char tmp[MAX_MSG_LEN];
     struct asyncmsg_dev *dev = file->private_data;
-    if(culc_free_space(dev) == 0)
+
+    int ret = wait_event_timeout(dev->write_q, culc_free_space(dev) > 0, msecs_to_jiffies(15000));
+    if(ret == 0)
+    {
+        return 0;
+    }
+    else if(ret < 0)
     {
         return -EFAULT;
     }
@@ -102,7 +114,8 @@ static ssize_t asyncmsg_write(struct file *file, const char __user *buf, size_t 
         dev->free_messages++;
     }
     printk(KERN_INFO "asyncmsg: write message with len %d\n", count);
-    
+    wake_up(&dev->read_q);
+
     return count;
 }
 
