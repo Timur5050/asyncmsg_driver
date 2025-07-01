@@ -15,7 +15,6 @@
 #define ASYNC_MSG_GET_STAT _IOR(ASYNC_MSG_IOC_MAGIC, 3, int)
 #define ASYNC_MSG_IOC_MXMR 3
 
-
 int main() {
     int fd = open(DEVICE_PATH, O_RDWR);
     if (fd < 0) {
@@ -25,12 +24,14 @@ int main() {
 
     printf("Testing ioctl on %s\n", DEVICE_PATH);
 
+    // CLEAR
     if (ioctl(fd, ASYNC_MSG_CLEAR_IO) == -1) {
         perror("ASYNC_MSG_CLEAR_IO failed");
     } else {
         printf("ASYNC_MSG_CLEAR_IO: success\n");
     }
 
+    // SET SIZE
     int new_size = 32;
     if (ioctl(fd, ASYNC_MSG_SET_SIZE, &new_size) == -1) {
         perror("ASYNC_MSG_SET_SIZE failed");
@@ -38,6 +39,7 @@ int main() {
         printf("ASYNC_MSG_SET_SIZE: new size set to %d\n", new_size);
     }
 
+    // GET SIZE
     int current_size = 0;
     if (ioctl(fd, ASYNC_MSG_GET_SIZE, &current_size) == -1) {
         perror("ASYNC_MSG_GET_SIZE failed");
@@ -45,8 +47,9 @@ int main() {
         printf("ASYNC_MSG_GET_SIZE: current size is %d\n", current_size);
     }
 
+    // GET STAT
     char stats_buf[512] = {0};
-    if (ioctl(fd, ASYNC_MSG_GET_STAT, stats_buf) == -1) {
+    if (ioctl(fd, ASYNC_MSG_GET_STAT, (void *)stats_buf) == -1) {
         perror("ASYNC_MSG_GET_STAT failed");
     } else {
         printf("ASYNC_MSG_GET_STAT:\n%s\n", stats_buf);
@@ -55,4 +58,3 @@ int main() {
     close(fd);
     return 0;
 }
-/*  */
