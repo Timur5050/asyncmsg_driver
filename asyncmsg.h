@@ -9,12 +9,20 @@
 #include <linux/interrupt.h>
 #include <linux/types.h> 
 #include <linux/wait.h>
+#include <linux/ratelimit.h>
+
 
 
 #define MAX_MSG_LEN 128
 #define MAX_QUEUE_SIZE 64
 #define RETURN_MESSAGE 512
 
+// ioctl
+#define ASYNC_MSG_IOC_MAGIC 't'
+#define ASYNC_MSG_CLEAR_IO _IO(ASYNC_MSG_IOC_MAGIC, 0)
+#define ASYNC_MSG_SET_SIZE _IOW(ASYNC_MSG_IOC_MAGIC, 1, int)
+#define ASYNC_MSG_GET_SIZE _IOR(ASYNC_MSG_IOC_MAGIC, 2, int)
+#define ASYNC_MSG_GET_STAT _IOR(ASYNC_MSG_IOC_MAGIC, 3, int)
 
 struct async_msg
 {
