@@ -10,7 +10,8 @@
 #include <linux/types.h> 
 #include <linux/wait.h>
 #include <linux/ratelimit.h>
-
+#include <linux/mempool.h>
+#include <linux/mm.h>
 
 
 #define MAX_MSG_LEN 128
@@ -24,6 +25,12 @@
 #define ASYNC_MSG_GET_SIZE _IOR(ASYNC_MSG_IOC_MAGIC, 2, int)
 #define ASYNC_MSG_GET_STAT _IOR(ASYNC_MSG_IOC_MAGIC, 3, int)
 
+// mempool
+#define MIN_POOL_OBJECTS 4
+
+static struct kmem_cache *asyncmsg_cache;
+static mempool_t *asyncmsg_mempool; 
+
 struct async_msg
 {
     char msg[MAX_MSG_LEN];
@@ -33,7 +40,9 @@ struct async_msg
 };
 
 struct asyncmsg_dev {
-    struct async_msg queue[MAX_QUEUE_SIZE];
+    // struct async_msg queue[MAX_QUEUE_SIZE];
+    int max_queue_size;
+    struct async_msg **queue;
     int head;
     int tail;
     int free_messages;
