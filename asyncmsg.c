@@ -121,12 +121,12 @@ static ssize_t asyncmsg_write(struct file *file, const char __user *buf, size_t 
     int ret = wait_event_interruptible_timeout(dev->write_q, culc_free_space(dev) > 0, msecs_to_jiffies(15000));
     if(ret == 0)
     {
-        up(&dev->sem)
+        up(&dev->sem);
         return 0;
     }
     else if(ret < 0)
     {
-        up(&dev->sem)
+        up(&dev->sem);
         return -EFAULT;
     }
 
