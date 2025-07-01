@@ -8,6 +8,12 @@ static int asyncmsg_major = 0;
 
 static void asyncmsg_timer_fn(struct timer_list *t);
 
+static void asyncmsg_contructor(void *ptr)
+{
+    memset(ptr, 0, sizeof(struct async_msg));
+    printk(KERN_INFO "asyncmsg: initializing slab object\n");
+}
+
 static int culc_free_space(struct asyncmsg_dev *dev)
 {
     return (dev->tail < MAX_QUEUE_SIZE) ? (MAX_QUEUE_SIZE - dev->tail) : 0;
@@ -70,7 +76,7 @@ static ssize_t asyncmsg_read(struct file *file, char __user *buf, size_t count, 
         return 0;
     }   
 
-    struct async_msg *curr_msg = &dev->queue[dev->head];
+    struct async_msg *curr_msg = dev->queue[dev->head];
     curr_msg->processed = true;
 
     len = snprintf(tmp, sizeof(tmp),
@@ -131,12 +137,12 @@ static ssize_t asyncmsg_write(struct file *file, const char __user *buf, size_t 
     }   
 
     tmp[count] = '\0';
-    struct async_msg new_mess;
-    memcpy(new_mess.msg, tmp, count);
-    new_mess.timestamp_ns = ktime_get_ns();
-    new_mess.len = count;
-    new_mess.processed = false;
-    
+    struct async_msg *new_mess = mempool_alloc(asyncmsg_mempool, GFP_KERNEL);
+
+    memcpy(new_mess->msg, tmp, count);
+    new_mess->timestamp_ns = ktime_get_ns();
+    new_mess->len = count;
+    new_mess->processed = false;
 
     dev->queue[dev->tail] = new_mess;
     dev->tail++;
@@ -186,6 +192,24 @@ static int __init asyncmsg_init(void)
         printk(KERN_ERR "asyncmsg: failed to allocate device number\n");
         return err;
     } 
+    asyncmsg_dev.max_queue_size = MAX_QUEUE_SIZE;
+    asyncmsg_dev.queue = kmalloc_array(MAX_QUEUE_SIZE, sizeof(struct async_msg *), GFP_KERNEL);
+
+    asyncmsg_cache = kmem_cache_create("asyncmsg_cache", sizeof(struct async_msg), 0,
+                                    SLAB_HWCACHE_ALIGN, asyncmsg_contructor);
+    
+    if(!asyncmsg_cache)
+    {
+        printk(KERN_ERR "asyncmsg: failed to create slab cache\n");
+        return -ENOMEM;
+    }
+
+    asyncmsg_mempool = mempool_create(MIN_POOL_OBJECTS, mempool_alloc_slab, mempool_free_slab, asyncmsg_cache);
+    if(!asyncmsg_mempool)
+    {
+        printk(KERN_ERR "asyncmsg: failed tp create mempool\n");
+        return -ENOMEM;
+    }
 
     // initializing device struct
     asyncmsg_dev.head = 0;
