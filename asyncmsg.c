@@ -16,7 +16,7 @@ static void asyncmsg_contructor(void *ptr)
 
 static int culc_free_space(struct asyncmsg_dev *dev)
 {
-    return (dev->tail < MAX_QUEUE_SIZE) ? (MAX_QUEUE_SIZE - dev->tail) : 0;
+    return (dev->tail < asyncmsg_dev.max_queue_size) ? (asyncmsg_dev.max_queue_size - dev->tail) : 0;
 }
 
 static int asyncmsg_open(struct inode *inode, struct file *filp)
@@ -109,7 +109,7 @@ static ssize_t asyncmsg_write(struct file *file, const char __user *buf, size_t 
     char tmp[MAX_MSG_LEN];
     struct asyncmsg_dev *dev = file->private_data;
 
-    if (dev->tail >= MAX_QUEUE_SIZE)
+    if (dev->tail >= asyncmsg_dev.max_queue_size)
     {
         return -ENOSPC;
     }
@@ -155,6 +155,93 @@ static ssize_t asyncmsg_write(struct file *file, const char __user *buf, size_t 
     return count;
 }
 
+static long asyncmsg_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    int err = 0;
+    int tmp;
+    struct asyncmsg_dev *dev = file->private_data;
+
+    if(_IOC_TYPE(cmd) != ASYNC_MSG_IOC_MAGIC)
+    {
+        return -EINVAL;
+    }
+    if(_IOC_NR(cmd) > ASYNC_MSG_IOC_MXMR)
+    {
+        return -EINVAL;
+    }
+
+    if(_IOC_DIR(cmd) & _IOC_READ)
+    {
+        err = !access_ok((void __user *)arg, _IOC_SIZE(cmd));
+    }
+    else if(_IOC_DIR(cmd) & _IOC_WRITE)
+    {
+        err = !access_ok((void __user *)arg, _IOC_SIZE(cmd));
+    }
+    if(err)
+    {
+        return -EFAULT;
+    }
+
+
+    switch(cmd)
+    {
+    case ASYNC_MSG_CLEAR_IO:
+        dev->head = 0;
+        dev->free_messages = 0;
+        dev->open_count = 0;
+
+        for(int i = 0; i < dev->tail; i++)
+        {
+            memset(dev->queue[i], 0, sizeof(struct async_msg));
+        }
+        dev->tail = 0;
+        break;
+    case ASYNC_MSG_SET_SIZE:
+        if(copy_from_user(&tmp, (int __user *)arg, sizeof(int)))
+        {
+            return -EFAULT;
+        }
+        if(tmp <= 0 || tmp >= 4096)
+        {
+            return -EINVAL;
+        }
+        dev->max_queue_size = tmp;
+        printk(KERN_INFO "asyncmsg: changed max size of queue for : %d\n", dev->max_queue_size);
+        break;
+    case ASYNC_MSG_GET_SIZE:
+        if(copy_to_user((int __user *)arg, dev->max_queue_size ,sizeof(int)))
+        {
+            return -EFAULT;
+        }
+        printk(KERN_INFO "asyncmsg: returned max buffer size : %d\n", dev->max_queue_size);
+        break;
+    case ASYNC_MSG_GET_STAT:
+        char tmp[RETURN_MESSAGE];   
+        int len;
+        unsigned long flags;
+
+        spin_lock_irqsave(&dev->lock, flags);
+        len = sprintf(tmp, sizeof(tmp),
+                    "asyncmsg: "
+                    "head=%d tail=%d free=%d open=%d delay_ms=%d\n",
+                    dev->head, 
+                    dev->tail,
+                    dev->free_messages,
+                    dev->open_count,
+                    dev->write_delay_ms);
+        spin_unlock_irqrestore(&dev->lock, flags);
+
+        if(copy_to_user((char __user*)arg, tmp, len))
+        {
+            return -EFAULT;
+        }
+        break;
+    }
+    return 0;
+
+}
+
 static void asyncmsg_timer_fn(struct timer_list *t)
 {
     struct asyncmsg_dev *dev = from_timer(dev, t, stat_timer);
@@ -180,6 +267,7 @@ static struct file_operations asyncmsg_fops = {
     .release = asyncmsg_release,
     .read = asyncmsg_read,
     .write = asyncmsg_write,
+    .unlocked_ioctl = asyncmsg_ioctl,
 };
 
 static int __init asyncmsg_init(void)
@@ -193,7 +281,7 @@ static int __init asyncmsg_init(void)
         return err;
     } 
     asyncmsg_dev.max_queue_size = MAX_QUEUE_SIZE;
-    asyncmsg_dev.queue = kmalloc_array(MAX_QUEUE_SIZE, sizeof(struct async_msg *), GFP_KERNEL);
+    asyncmsg_dev.queue = kmalloc_array(asyncmsg_dev.max_queue_size, sizeof(struct async_msg *), GFP_KERNEL);
 
     asyncmsg_cache = kmem_cache_create("asyncmsg_cache", sizeof(struct async_msg), 0,
                                     SLAB_HWCACHE_ALIGN, asyncmsg_contructor);
