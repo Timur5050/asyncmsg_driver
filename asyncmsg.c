@@ -105,7 +105,6 @@ static ssize_t asyncmsg_write(struct file *file, const char __user *buf, size_t 
 
     if (dev->tail >= MAX_QUEUE_SIZE)
     {
-        up(&dev->sem);
         return -ENOSPC;
     }
 
@@ -156,20 +155,16 @@ static void asyncmsg_timer_fn(struct timer_list *t)
     unsigned long flags;
 
     spin_lock_irqsave(&dev->lock, flags);
-    printk(KERN_INFO  "asyncmsg: "
-                        "head position: %d\n"
-                        "tail position: %d\n"
-                        "free messages: %d\n"
-                        "open count: %d\n"
-                        "write delay ms: %d\n",
-                        dev->head, 
-                        dev->tail,
-                        dev->free_messages,
-                        dev->open_count,
-                        dev->write_delay_ms);
+    pr_info_ratelimited("asyncmsg: "
+                    "head=%d tail=%d free=%d open=%d delay_ms=%d\n",
+                    dev->head, 
+                    dev->tail,
+                    dev->free_messages,
+                    dev->open_count,
+                    dev->write_delay_ms);
     spin_unlock_irqrestore(&dev->lock, flags);
 
-    mod_timer(&dev->stat_timer, jiffies + msecs_to_jiffies(10000));
+    mod_timer(&dev->stat_timer, jiffies + msecs_to_jiffies(600000));
 }
 
 
@@ -204,7 +199,7 @@ static int __init asyncmsg_init(void)
     init_waitqueue_head(&asyncmsg_dev.write_q);
 
     timer_setup(&asyncmsg_dev.stat_timer, asyncmsg_timer_fn, 0);
-    mod_timer(&asyncmsg_dev.stat_timer, jiffies + msecs_to_jiffies(10000));
+    mod_timer(&asyncmsg_dev.stat_timer, jiffies + msecs_to_jiffies(600000));
 
     // mod_timer(&asyncmsg_dev.stat_timer, jiffies + msecs_to_jiffies(10000));
     // tasklet_init(&asyncmsg_dev.tasklet, asyncmsg_tasklet_fn, (unsigned long)&asyncmsg_dev);
@@ -256,7 +251,7 @@ static void __exit asyncmsg_exit(void)
     cdev_del(&asyncmsg_dev.cdev);
     // flush_workqueue(asyncmsg_dev.wq);
     // destroy_workqueue(asyncmsg_dev.wq);
-    // del_timer_sync(&asyncmsg_dev.timer);
+    del_timer_sync(&asyncmsg_dev.stat_timer);
     // tasklet_kill(&asyncmsg_dev.tasklet);
     unregister_chrdev_region(   asyncmsg_devno, 1);
     printk(KERN_INFO "asyncmsg: module unloaded\n");
