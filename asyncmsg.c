@@ -55,19 +55,21 @@ static ssize_t asyncmsg_read(struct file *file, char __user *buf, size_t count, 
         return 0;
     }
 
+    if(down_interruptible(&dev->sem))
+    {
+        return -ERESTARTSYS;
+    }
+
     int ret = wait_event_interruptible_timeout(dev->read_q, dev->free_messages > 0, msecs_to_jiffies(15000));
     if(ret == 0)
     {
+        up(&dev->sem);
         return 0;
     }
     else if(ret < 0)
     {
+        up(&dev->sem);
         return -EFAULT;
-    }
-
-    if(down_interruptible(&dev->sem))
-    {
-        return -ERESTARTSYS;
     }
 
     if (dev->head >= dev->tail)
@@ -80,14 +82,11 @@ static ssize_t asyncmsg_read(struct file *file, char __user *buf, size_t count, 
     curr_msg->processed = true;
 
     len = snprintf(tmp, sizeof(tmp),
-                "message: %s\n"
-                "len: %ld\n"
-                "timestamp_ns: %lld\n"
-                "processed: %d\n",
-                curr_msg->msg,
-                curr_msg->len,
-                curr_msg->timestamp_ns,
-                curr_msg->processed);
+        "message: %.*s\nlen: %ld\ntimestamp_ns: %lld\nprocessed: %d\n",
+        (int)curr_msg->len, curr_msg->msg,
+        curr_msg->len,
+        curr_msg->timestamp_ns,
+        curr_msg->processed);
 
     if (copy_to_user(buf, tmp, len))
     {
@@ -114,20 +113,23 @@ static ssize_t asyncmsg_write(struct file *file, const char __user *buf, size_t 
         return -ENOSPC;
     }
 
-    int ret = wait_event_interruptible_timeout(dev->write_q, culc_free_space(dev) > 0, msecs_to_jiffies(15000));
-    if(ret == 0)
-    {
-        return 0;
-    }
-    else if(ret < 0)
-    {
-        return -EFAULT;
-    }
-
     if(down_interruptible(&dev->sem))
     {
         return -ERESTARTSYS;
     }
+
+    int ret = wait_event_interruptible_timeout(dev->write_q, culc_free_space(dev) > 0, msecs_to_jiffies(15000));
+    if(ret == 0)
+    {
+        up(&dev->sem)
+        return 0;
+    }
+    else if(ret < 0)
+    {
+        up(&dev->sem)
+        return -EFAULT;
+    }
+
 
     count = min((size_t)MAX_MSG_LEN, count);
     if(copy_from_user(tmp, buf, count))
@@ -193,7 +195,8 @@ static long asyncmsg_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 
         for(int i = 0; i < dev->tail; i++)
         {
-            memset(dev->queue[i], 0, sizeof(struct async_msg));
+            mempool_free(dev->queue[i], asyncmsg_mempool);
+            dev->queue[i] = NULL;
         }
         dev->tail = 0;
         break;
@@ -210,7 +213,8 @@ static long asyncmsg_ioctl(struct file *file, unsigned int cmd, unsigned long ar
         printk(KERN_INFO "asyncmsg: changed max size of queue for : %d\n", dev->max_queue_size);
         break;
     case ASYNC_MSG_GET_SIZE:
-        if(copy_to_user((int __user *)arg, dev->max_queue_size ,sizeof(int)))
+        tmp = dev->max_queue_size;
+        if(copy_to_user((int __user *)arg, &tmp ,sizeof(int)))
         {
             return -EFAULT;
         }
@@ -222,7 +226,7 @@ static long asyncmsg_ioctl(struct file *file, unsigned int cmd, unsigned long ar
         unsigned long flags;
 
         spin_lock_irqsave(&dev->lock, flags);
-        len = sprintf(tmp, sizeof(tmp),
+        len = snprintf(tmp, sizeof(tmp),
                     "asyncmsg: "
                     "head=%d tail=%d free=%d open=%d delay_ms=%d\n",
                     dev->head, 
@@ -282,6 +286,11 @@ static int __init asyncmsg_init(void)
     } 
     asyncmsg_dev.max_queue_size = MAX_QUEUE_SIZE;
     asyncmsg_dev.queue = kmalloc_array(asyncmsg_dev.max_queue_size, sizeof(struct async_msg *), GFP_KERNEL);
+    if (!asyncmsg_dev.queue) {
+        printk(KERN_ERR "asyncmsg: failed to allocate queue\n");
+        return -ENOMEM;
+    }
+    memset(asyncmsg_dev.queue, 0, asyncmsg_dev.max_queue_size * sizeof(struct async_msg *));
 
     asyncmsg_cache = kmem_cache_create("asyncmsg_cache", sizeof(struct async_msg), 0,
                                     SLAB_HWCACHE_ALIGN, asyncmsg_contructor);
@@ -358,17 +367,22 @@ fail_wq:
 
 static void __exit asyncmsg_exit(void)
 {
+    for (int i = 0; i < asyncmsg_dev.tail; i++) {
+        if (asyncmsg_dev.queue[i]) {
+            mempool_free(asyncmsg_dev.queue[i], asyncmsg_mempool);
+            asyncmsg_dev.queue[i] = NULL;
+        }
+    }
+    kfree(asyncmsg_dev.queue);
     device_destroy(asyncmsg_class, asyncmsg_devno);
     class_destroy(asyncmsg_class);
     cdev_del(&asyncmsg_dev.cdev);
-    // flush_workqueue(asyncmsg_dev.wq);
-    // destroy_workqueue(asyncmsg_dev.wq);
     del_timer_sync(&asyncmsg_dev.stat_timer);
-    // tasklet_kill(&asyncmsg_dev.tasklet);
-    unregister_chrdev_region(   asyncmsg_devno, 1);
+    mempool_destroy(asyncmsg_mempool);
+    kmem_cache_destroy(asyncmsg_cache);
+    unregister_chrdev_region(asyncmsg_devno, 1);
     printk(KERN_INFO "asyncmsg: module unloaded\n");
 }
-
 
 module_init(asyncmsg_init);
 module_exit(asyncmsg_exit);
