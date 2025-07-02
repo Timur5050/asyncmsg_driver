@@ -55,21 +55,20 @@ static ssize_t asyncmsg_read(struct file *file, char __user *buf, size_t count, 
         return 0;
     }
 
-    if(down_interruptible(&dev->sem))
-    {
-        return -ERESTARTSYS;
-    }
 
     int ret = wait_event_interruptible_timeout(dev->read_q, dev->free_messages > 0, msecs_to_jiffies(15000));
     if(ret == 0)
     {
-        up(&dev->sem);
         return 0;
     }
     else if(ret < 0)
     {
-        up(&dev->sem);
         return -EFAULT;
+    }
+
+    if(down_interruptible(&dev->sem))
+    {
+        return -ERESTARTSYS;
     }
 
     if (dev->head >= dev->tail)
@@ -113,23 +112,22 @@ static ssize_t asyncmsg_write(struct file *file, const char __user *buf, size_t 
         return -ENOSPC;
     }
 
-    if(down_interruptible(&dev->sem))
-    {
-        return -ERESTARTSYS;
-    }
+
 
     int ret = wait_event_interruptible_timeout(dev->write_q, culc_free_space(dev) > 0, msecs_to_jiffies(15000));
     if(ret == 0)
     {
-        up(&dev->sem);
         return 0;
     }
     else if(ret < 0)
     {
-        up(&dev->sem);
         return -EFAULT;
     }
 
+    if(down_interruptible(&dev->sem))
+    {
+        return -ERESTARTSYS;
+    }
 
     count = min((size_t)MAX_MSG_LEN, count);
     if(copy_from_user(tmp, buf, count))
@@ -191,7 +189,6 @@ static long asyncmsg_ioctl(struct file *file, unsigned int cmd, unsigned long ar
     case ASYNC_MSG_CLEAR_IO:
         dev->head = 0;
         dev->free_messages = 0;
-        dev->open_count = 0;
 
         for(int i = 0; i < dev->tail; i++)
         {
@@ -214,10 +211,8 @@ static long asyncmsg_ioctl(struct file *file, unsigned int cmd, unsigned long ar
         break;
     case ASYNC_MSG_GET_SIZE:
         tmp = dev->max_queue_size;
-        if(copy_to_user((int __user *)arg, &tmp ,sizeof(int)))
-        {
+        if (copy_to_user((int __user *)arg, &tmp, sizeof(int)))
             return -EFAULT;
-        }
         printk(KERN_INFO "asyncmsg: returned max buffer size : %d\n", dev->max_queue_size);
         break;
     case ASYNC_MSG_GET_STAT:
@@ -228,12 +223,13 @@ static long asyncmsg_ioctl(struct file *file, unsigned int cmd, unsigned long ar
         spin_lock_irqsave(&dev->lock, flags);
         len = snprintf(tmp, sizeof(tmp),
                     "asyncmsg: "
-                    "head=%d tail=%d free=%d open=%d delay_ms=%d\n",
+                    "head=%d tail=%d free=%d open=%d delay_ms=%d max size=%d\n",
                     dev->head, 
                     dev->tail,
                     dev->free_messages,
                     dev->open_count,
-                    dev->write_delay_ms);
+                    dev->write_delay_ms,
+                    dev->max_queue_size);
         spin_unlock_irqrestore(&dev->lock, flags);
 
         if(copy_to_user((char __user*)arg, tmp, len))
@@ -253,12 +249,13 @@ static void asyncmsg_timer_fn(struct timer_list *t)
 
     spin_lock_irqsave(&dev->lock, flags);
     pr_info_ratelimited("asyncmsg: "
-                    "head=%d tail=%d free=%d open=%d delay_ms=%d\n",
+                    "head=%d tail=%d free=%d open=%d delay_ms=%d max size=%d\n",
                     dev->head, 
                     dev->tail,
                     dev->free_messages,
                     dev->open_count,
-                    dev->write_delay_ms);
+                    dev->write_delay_ms,
+                    dev->max_queue_size);
     spin_unlock_irqrestore(&dev->lock, flags);
 
     mod_timer(&dev->stat_timer, jiffies + msecs_to_jiffies(600000));
