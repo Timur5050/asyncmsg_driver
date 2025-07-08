@@ -29,8 +29,6 @@
 // mempool
 #define MIN_POOL_OBJECTS 4
 
-static struct kmem_cache *asyncmsg_cache;
-static mempool_t *asyncmsg_mempool; 
 
 struct async_msg
 {
@@ -49,6 +47,9 @@ struct asyncmsg_dev {
     int free_messages;
     int open_count;
     struct cdev cdev;
+
+    struct kmem_cache *asyncmsg_cache;
+    mempool_t *asyncmsg_mempool; 
 
     struct semaphore sem;
     spinlock_t lock;
