@@ -7,6 +7,7 @@ static struct class *asyncmsg_class;
 static int asyncmsg_major = 0;
 
 static void asyncmsg_timer_fn(struct timer_list *t);
+static void asyncmsg_tasklet_fn(unsigned long arg);
 
 static void asyncmsg_contructor(void *ptr)
 {
@@ -112,8 +113,6 @@ static ssize_t asyncmsg_write(struct file *file, const char __user *buf, size_t 
         return -ENOSPC;
     }
 
-
-
     int ret = wait_event_interruptible_timeout(dev->write_q, culc_free_space(dev) > 0, msecs_to_jiffies(15000));
     if(ret == 0)
     {
@@ -137,7 +136,7 @@ static ssize_t asyncmsg_write(struct file *file, const char __user *buf, size_t 
     }   
 
     tmp[count] = '\0';
-    struct async_msg *new_mess = mempool_alloc(asyncmsg_mempool, GFP_KERNEL);
+    struct async_msg *new_mess = mempool_alloc(dev->asyncmsg_mempool, GFP_KERNEL);
 
     memcpy(new_mess->msg, tmp, count);
     new_mess->timestamp_ns = ktime_get_ns();
@@ -148,9 +147,9 @@ static ssize_t asyncmsg_write(struct file *file, const char __user *buf, size_t 
     dev->tail++;
     dev->free_messages++;
 
-    printk(KERN_INFO "asyncmsg: write message with len %d\n", count);
     wake_up(&dev->read_q);
     up(&dev->sem);
+    tasklet_schedule(&dev->msg_tasklet);
 
     return count;
 }
@@ -192,7 +191,7 @@ static long asyncmsg_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 
         for(int i = 0; i < dev->tail; i++)
         {
-            mempool_free(dev->queue[i], asyncmsg_mempool);
+            mempool_free(dev->queue[i], dev->asyncmsg_mempool);
             dev->queue[i] = NULL;
         }
         dev->tail = 0;
@@ -261,6 +260,23 @@ static void asyncmsg_timer_fn(struct timer_list *t)
     mod_timer(&dev->stat_timer, jiffies + msecs_to_jiffies(600000));
 }
 
+static void asyncmsg_tasklet_fn(unsigned long arg)
+{
+    struct asyncmsg_dev *dev = (struct asyncmsg_dev *)arg;
+    unsigned long flags;
+    int letter_counter = 0;
+
+    if (dev->tail > 0 && dev->queue[dev->tail - 1]) {
+        char *tmp = dev->queue[dev->tail - 1]->msg;
+        while (*tmp != '\0') {
+            if ((*tmp >= 'a' && *tmp <= 'z') || (*tmp >= 'A' && *tmp <= 'Z')) {
+                letter_counter++;
+            }
+            tmp++;
+        }
+        printk(KERN_INFO "asyncmsg: got message with %d letters\n", letter_counter);
+    }
+}
 
 static struct file_operations asyncmsg_fops = {
     .owner = THIS_MODULE,
@@ -289,17 +305,18 @@ static int __init asyncmsg_init(void)
     }
     memset(asyncmsg_dev.queue, 0, asyncmsg_dev.max_queue_size * sizeof(struct async_msg *));
 
-    asyncmsg_cache = kmem_cache_create("asyncmsg_cache", sizeof(struct async_msg), 0,
+    asyncmsg_dev.asyncmsg_cache = kmem_cache_create("asyncmsg_cache", sizeof(struct async_msg), 0,
                                     SLAB_HWCACHE_ALIGN, asyncmsg_contructor);
     
-    if(!asyncmsg_cache)
+    if(!asyncmsg_dev.asyncmsg_cache)
     {
         printk(KERN_ERR "asyncmsg: failed to create slab cache\n");
         return -ENOMEM;
     }
 
-    asyncmsg_mempool = mempool_create(MIN_POOL_OBJECTS, mempool_alloc_slab, mempool_free_slab, asyncmsg_cache);
-    if(!asyncmsg_mempool)
+    asyncmsg_dev.asyncmsg_mempool = mempool_create(MIN_POOL_OBJECTS, mempool_alloc_slab, 
+                                            mempool_free_slab, asyncmsg_dev.asyncmsg_cache);
+    if(!asyncmsg_dev.asyncmsg_mempool)
     {
         printk(KERN_ERR "asyncmsg: failed tp create mempool\n");
         return -ENOMEM;
@@ -320,7 +337,7 @@ static int __init asyncmsg_init(void)
     mod_timer(&asyncmsg_dev.stat_timer, jiffies + msecs_to_jiffies(600000));
 
     // mod_timer(&asyncmsg_dev.stat_timer, jiffies + msecs_to_jiffies(10000));
-    // tasklet_init(&asyncmsg_dev.tasklet, asyncmsg_tasklet_fn, (unsigned long)&asyncmsg_dev);
+    tasklet_init(&asyncmsg_dev.msg_tasklet, asyncmsg_tasklet_fn, (unsigned long)&asyncmsg_dev);
     asyncmsg_dev.wq = create_singlethread_workqueue("asyncmsg_wq");
     if(!asyncmsg_dev.wq)
     {
@@ -366,7 +383,7 @@ static void __exit asyncmsg_exit(void)
 {
     for (int i = 0; i < asyncmsg_dev.tail; i++) {
         if (asyncmsg_dev.queue[i]) {
-            mempool_free(asyncmsg_dev.queue[i], asyncmsg_mempool);
+            mempool_free(asyncmsg_dev.queue[i], asyncmsg_dev.asyncmsg_mempool);
             asyncmsg_dev.queue[i] = NULL;
         }
     }
@@ -375,8 +392,8 @@ static void __exit asyncmsg_exit(void)
     class_destroy(asyncmsg_class);
     cdev_del(&asyncmsg_dev.cdev);
     del_timer_sync(&asyncmsg_dev.stat_timer);
-    mempool_destroy(asyncmsg_mempool);
-    kmem_cache_destroy(asyncmsg_cache);
+    mempool_destroy(asyncmsg_dev.asyncmsg_mempool);
+    kmem_cache_destroy(asyncmsg_dev.asyncmsg_cache);
     unregister_chrdev_region(asyncmsg_devno, 1);
     printk(KERN_INFO "asyncmsg: module unloaded\n");
 }
@@ -386,5 +403,5 @@ module_exit(asyncmsg_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Timur5050");
-MODULE_DESCRIPTION("driver that covers almost all material from 0 to 7 chapters from book");
+MODULE_DESCRIPTION("driver that covers almost all material from 0 to 7, 9 chapters from book");
 MODULE_VERSION("1.0.0");
