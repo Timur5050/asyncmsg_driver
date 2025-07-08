@@ -20,6 +20,12 @@ static int culc_free_space(struct asyncmsg_dev *dev)
     return (dev->tail < asyncmsg_dev.max_queue_size) ? (asyncmsg_dev.max_queue_size - dev->tail) : 0;
 }
 
+static int asyncmsg_fasync(int fd, struct file *file, int on)
+{
+    struct asyncmsg_dev *dev = file->private_data;
+    return fasync_helper(fd, file, on, &dev->fasync_queue);
+}
+
 static int asyncmsg_open(struct inode *inode, struct file *filp)
 {
     filp->private_data = &asyncmsg_dev;
@@ -166,6 +172,11 @@ static ssize_t asyncmsg_write(struct file *file, const char __user *buf, size_t 
     dev->free_messages++;
     dev->last_jiffies = curr_jiffies;
 
+    if(dev->fasync_queue)
+    {
+        kill_fasync(&dev->fasync_queue, SIGIO, POLL_IN);
+    }
+
     wake_up(&dev->read_q);
     up(&dev->sem);
     tasklet_schedule(&dev->msg_tasklet);
@@ -260,6 +271,26 @@ static long asyncmsg_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 
 }
 
+static __poll_t asyncmsg_poll(struct file *file, struct poll_table_struct *wait)
+{
+    struct asyncmsg_dev *dev = file->private_data;
+    __poll_t mask = 0;
+
+    poll_wait(file, &dev->read_q, wait);
+    poll_wait(file, &dev->write_q, wait);
+
+    if(dev->free_messages > 0)
+    {
+        mask |= POLLIN | POLLRDNORM;
+    }
+    if(culc_free_space(dev) > 0)
+    {
+        mask |= POLLOUT | POLLWRNORM;
+    }
+
+    return mask;
+}
+
 static void asyncmsg_timer_fn(struct timer_list *t)
 {
     struct asyncmsg_dev *dev = from_timer(dev, t, stat_timer);
@@ -303,6 +334,8 @@ static struct file_operations asyncmsg_fops = {
     .read = asyncmsg_read,
     .write = asyncmsg_write,
     .unlocked_ioctl = asyncmsg_ioctl,
+    .fasync = asyncmsg_fasync,
+    .poll = asyncmsg_poll,
 };
 
 static int __init asyncmsg_init(void)
