@@ -56,7 +56,6 @@ static ssize_t asyncmsg_read(struct file *file, char __user *buf, size_t count, 
         return 0;
     }
 
-
     int ret = wait_event_interruptible_timeout(dev->read_q, dev->free_messages > 0, msecs_to_jiffies(15000));
     if(ret == 0)
     {
@@ -107,6 +106,8 @@ static ssize_t asyncmsg_write(struct file *file, const char __user *buf, size_t 
 {
     char tmp[MAX_MSG_LEN];
     struct asyncmsg_dev *dev = file->private_data;
+    unsigned long curr_jiffies = jiffies;
+    unsigned long new_interval;
 
     if (dev->tail >= asyncmsg_dev.max_queue_size)
     {
@@ -128,6 +129,13 @@ static ssize_t asyncmsg_write(struct file *file, const char __user *buf, size_t 
         return -ERESTARTSYS;
     }
 
+    if(dev->last_jiffies && time_before(curr_jiffies, dev->last_jiffies + msecs_to_jiffies(dev->write_delay_ms)))
+    {
+        printk(KERN_INFO "asyncmsg: not so fast. we have delay : %d ms, between writes\n", dev->write_delay_ms);
+        up(&dev->sem);
+        return -EAGAIN;
+    }
+
     count = min((size_t)MAX_MSG_LEN, count);
     if(copy_from_user(tmp, buf, count))
     {
@@ -136,6 +144,16 @@ static ssize_t asyncmsg_write(struct file *file, const char __user *buf, size_t 
     }   
 
     tmp[count] = '\0';
+
+    if(sscanf(tmp, "interval=%lu", &new_interval) == 1)
+    {
+        dev->write_delay_ms = new_interval;
+        dev->last_jiffies = curr_jiffies;
+        printk(KERN_INFO "asyncmsg: set interval to %lu ms \n", new_interval);
+        up(&dev->sem);
+        return count;
+    }
+
     struct async_msg *new_mess = mempool_alloc(dev->asyncmsg_mempool, GFP_KERNEL);
 
     memcpy(new_mess->msg, tmp, count);
@@ -146,6 +164,7 @@ static ssize_t asyncmsg_write(struct file *file, const char __user *buf, size_t 
     dev->queue[dev->tail] = new_mess;
     dev->tail++;
     dev->free_messages++;
+    dev->last_jiffies = curr_jiffies;
 
     wake_up(&dev->read_q);
     up(&dev->sem);
@@ -263,7 +282,6 @@ static void asyncmsg_timer_fn(struct timer_list *t)
 static void asyncmsg_tasklet_fn(unsigned long arg)
 {
     struct asyncmsg_dev *dev = (struct asyncmsg_dev *)arg;
-    unsigned long flags;
     int letter_counter = 0;
 
     if (dev->tail > 0 && dev->queue[dev->tail - 1]) {
@@ -327,6 +345,7 @@ static int __init asyncmsg_init(void)
     asyncmsg_dev.tail = 0;
     asyncmsg_dev.free_messages = 0;
     asyncmsg_dev.open_count = 0;
+    asyncmsg_dev.last_jiffies = 0;
 
     sema_init(&asyncmsg_dev.sem, 1);
     spin_lock_init(&asyncmsg_dev.lock);
@@ -336,7 +355,6 @@ static int __init asyncmsg_init(void)
     timer_setup(&asyncmsg_dev.stat_timer, asyncmsg_timer_fn, 0);
     mod_timer(&asyncmsg_dev.stat_timer, jiffies + msecs_to_jiffies(600000));
 
-    // mod_timer(&asyncmsg_dev.stat_timer, jiffies + msecs_to_jiffies(10000));
     tasklet_init(&asyncmsg_dev.msg_tasklet, asyncmsg_tasklet_fn, (unsigned long)&asyncmsg_dev);
     asyncmsg_dev.wq = create_singlethread_workqueue("asyncmsg_wq");
     if(!asyncmsg_dev.wq)
