@@ -13,6 +13,7 @@
 #include <linux/mempool.h>
 #include <linux/mm.h>
 #include <linux/jiffies.h>
+#include <linux/poll.h>
 
 
 #define MAX_MSG_LEN 128
@@ -66,6 +67,8 @@ struct asyncmsg_dev {
 
     unsigned long last_jiffies;
     unsigned int write_delay_ms;
+
+    struct fasync_struct *fasync_queue;
 };
 
 
