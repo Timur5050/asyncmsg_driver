@@ -18,3 +18,4 @@ echo "[*] Setting permissions..."
 sudo chmod 666 /dev/asyncmsg
 
 echo "[+] Done! Module reloaded and ready."
+
