@@ -25,7 +25,6 @@ int main() {
     }
 
     printf("Testing ioctl on %s\n", DEVICE_PATH);
-
     char stats_buf[512] = {0};
     if (ioctl(fd, ASYNC_MSG_GET_STAT, (void *)stats_buf) == -1) {
         perror("ASYNC_MSG_GET_STAT failed");
