@@ -1,5 +1,11 @@
 #include "asyncmsg.h"
 
+#include <linux/fs.h>
+#include <linux/file.h>
+
+#define DB_MAIN_PATH "/tmp/asyncmsg_db.json"
+#define DB_META_PATH "/tmp/asyncmsg_meta.json"
+#define DB_DLQ_PATH "/tmp/asyncmsg_dlq.json"
 
 static struct asyncmsg_dev asyncmsg_dev;
 static dev_t asyncmsg_devno;
@@ -8,6 +14,68 @@ static int asyncmsg_major = 0;
 
 static void asyncmsg_timer_fn(struct timer_list *t);
 static void asyncmsg_tasklet_fn(unsigned long arg);
+
+static void save_to_json_db(struct async_msg *msg)
+{
+    struct file *f;
+    loff_t pos = 0;
+    char buf[512];
+    int len;
+
+    /* O_APPEND гарантує, що нові записи будуть додаватись в кінець */
+    f = filp_open(DB_MAIN_PATH, O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (IS_ERR(f)) {
+        printk(KERN_ERR "asyncmsg: failed to open main db file\n");
+        return;
+    }
+
+    len = snprintf(buf, sizeof(buf),
+        "{\"entity\": \"message\", \"timestamp_ns\": %llu, \"len\": %zu, \"msg\": \"%s\", \"processed\": %s}\n",
+        msg->timestamp_ns, msg->len, msg->msg, msg->processed ? "true" : "false");
+
+    kernel_write(f, buf, len, &pos);
+    filp_close(f, NULL);
+}
+
+static void save_meta_db(struct asyncmsg_dev *dev)
+{
+    struct file *f;
+    loff_t pos = 0;
+    char buf[512];
+    int len;
+
+    /* O_TRUNC перезаписує файл, щоб там завжди був лише актуальний стан */
+    f = filp_open(DB_META_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (IS_ERR(f)) {
+        printk(KERN_ERR "asyncmsg: failed to open meta db file\n");
+        return;
+    }
+
+    len = snprintf(buf, sizeof(buf),
+        "{\"entity\": \"statistics\", \"max_queue_size\": %d, \"head\": %d, \"tail\": %d, \"free_messages\": %d, \"open_count\": %d}\n",
+        dev->max_queue_size, dev->head, dev->tail, dev->free_messages, dev->open_count);
+
+    kernel_write(f, buf, len, &pos);
+    filp_close(f, NULL);
+}
+
+static void save_to_dlq_db(const char *msg_text, size_t len, const char *reason)
+{
+    struct file *f;
+    loff_t pos = 0;
+    char buf[512];
+    int json_len;
+
+    f = filp_open(DB_DLQ_PATH, O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (IS_ERR(f)) return;
+
+    json_len = snprintf(buf, sizeof(buf),
+        "{\"entity\": \"dead_letter\", \"timestamp_ns\": %llu, \"len\": %zu, \"msg\": \"%s\", \"reason\": \"%s\"}\n",
+        ktime_get_ns(), len, msg_text, reason);
+
+    kernel_write(f, buf, json_len, &pos);
+    filp_close(f, NULL);
+}
 
 static void asyncmsg_contructor(void *ptr)
 {
@@ -105,6 +173,8 @@ static ssize_t asyncmsg_read(struct file *file, char __user *buf, size_t count, 
     up(&dev->sem);
     wake_up(&dev->write_q);
     
+    save_meta_db(dev);
+
     return len;
 }
 
@@ -114,45 +184,21 @@ static ssize_t asyncmsg_write(struct file *file, const char __user *buf, size_t 
     struct asyncmsg_dev *dev = file->private_data;
     unsigned long curr_jiffies = jiffies;
     unsigned long new_interval;
+    int ret;
+    struct async_msg *new_mess;
 
-    if (dev->tail >= asyncmsg_dev.max_queue_size)
-    {
-        return -ENOSPC;
-    }
-
-    int ret = wait_event_interruptible_timeout(dev->write_q, culc_free_space(dev) > 0, msecs_to_jiffies(15000));
-    if(ret == 0)
-    {
-        return 0;
-    }
-    else if(ret < 0)
-    {
-        return -EFAULT;
-    }
-
-    if(down_interruptible(&dev->sem))
-    {
-        return -ERESTARTSYS;
-    }
-
-    if(dev->last_jiffies && time_before(curr_jiffies, dev->last_jiffies + msecs_to_jiffies(dev->write_delay_ms)))
-    {
-        printk(KERN_INFO "asyncmsg: not so fast. we have delay : %d ms, between writes\n", dev->write_delay_ms);
-        up(&dev->sem);
-        return -EAGAIN;
-    }
-
-    count = min((size_t)MAX_MSG_LEN, count);
+    /* 1. Читаємо дані від користувача ОДРАЗУ, до всіх перевірок */
+    count = min((size_t)(MAX_MSG_LEN - 1), count);
     if(copy_from_user(tmp, buf, count))
     {
-        up(&dev->sem);
         return -EFAULT;
-    }   
-
+    }
     tmp[count] = '\0';
 
+    /* Перевіряємо чи це не команда зміни інтервалу */
     if(sscanf(tmp, "interval=%lu", &new_interval) == 1)
     {
+        if(down_interruptible(&dev->sem)) return -ERESTARTSYS;
         dev->write_delay_ms = new_interval;
         dev->last_jiffies = curr_jiffies;
         printk(KERN_INFO "asyncmsg: set interval to %lu ms \n", new_interval);
@@ -160,8 +206,42 @@ static ssize_t asyncmsg_write(struct file *file, const char __user *buf, size_t 
         return count;
     }
 
-    struct async_msg *new_mess = mempool_alloc(dev->asyncmsg_mempool, GFP_KERNEL);
+    /* 2. Якщо черга жорстко переповнена - пишемо в DLQ і виходимо */
+    if (dev->tail >= dev->max_queue_size)
+    {
+        save_to_dlq_db(tmp, count, "queue_full_hard_limit");
+        return -ENOSPC;
+    }
 
+    /* 3. Очікуємо на вільне місце. Якщо таймаут - пишемо в DLQ */
+    ret = wait_event_interruptible_timeout(dev->write_q, culc_free_space(dev) > 0, msecs_to_jiffies(15000));
+    if(ret == 0)
+    {
+        save_to_dlq_db(tmp, count, "wait_timeout");
+        return 0;
+    }
+    else if(ret < 0)
+    {
+        return -EFAULT;
+    }
+
+    /* 4. Беремо семафор для запису */
+    if(down_interruptible(&dev->sem))
+    {
+        return -ERESTARTSYS;
+    }
+
+    /* 5. Перевіряємо затримку (rate limit). Якщо зарано - пишемо в DLQ */
+    if(dev->last_jiffies && time_before(curr_jiffies, dev->last_jiffies + msecs_to_jiffies(dev->write_delay_ms)))
+    {
+        printk(KERN_INFO "asyncmsg: not so fast. we have delay : %d ms, between writes\n", dev->write_delay_ms);
+        save_to_dlq_db(tmp, count, "rate_limit_exceeded");
+        up(&dev->sem);
+        return -EAGAIN;
+    }
+
+    /* ТУТ ВЖЕ ВСЕ ДОБРЕ. Створюємо повідомлення і додаємо в основну БД */
+    new_mess = mempool_alloc(dev->asyncmsg_mempool, GFP_KERNEL);
     memcpy(new_mess->msg, tmp, count);
     new_mess->timestamp_ns = ktime_get_ns();
     new_mess->len = count;
@@ -171,6 +251,10 @@ static ssize_t asyncmsg_write(struct file *file, const char __user *buf, size_t 
     dev->tail++;
     dev->free_messages++;
     dev->last_jiffies = curr_jiffies;
+
+    /* Зберігаємо в основний лог і оновлюємо метрику */
+    save_to_json_db(new_mess);
+    save_meta_db(dev);
 
     if(dev->fasync_queue)
     {
@@ -293,7 +377,7 @@ static __poll_t asyncmsg_poll(struct file *file, struct poll_table_struct *wait)
 
 static void asyncmsg_timer_fn(struct timer_list *t)
 {
-    struct asyncmsg_dev *dev = from_timer(dev, t, stat_timer);
+    struct asyncmsg_dev *dev = timer_container_of(dev, t, stat_timer);
     unsigned long flags;
 
     spin_lock_irqsave(&dev->lock, flags);
@@ -442,7 +526,7 @@ static void __exit asyncmsg_exit(void)
     device_destroy(asyncmsg_class, asyncmsg_devno);
     class_destroy(asyncmsg_class);
     cdev_del(&asyncmsg_dev.cdev);
-    del_timer_sync(&asyncmsg_dev.stat_timer);
+    timer_delete_sync(&asyncmsg_dev.stat_timer);
     mempool_destroy(asyncmsg_dev.asyncmsg_mempool);
     kmem_cache_destroy(asyncmsg_dev.asyncmsg_cache);
     unregister_chrdev_region(asyncmsg_devno, 1);

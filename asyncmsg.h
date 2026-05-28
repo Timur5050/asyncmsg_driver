@@ -14,10 +14,11 @@
 #include <linux/mm.h>
 #include <linux/jiffies.h>
 #include <linux/poll.h>
+#include <linux/timer.h>
 
 
 #define MAX_MSG_LEN 128
-#define MAX_QUEUE_SIZE 64
+#define MAX_QUEUE_SIZE 4
 #define RETURN_MESSAGE 512
 
 // ioctl
@@ -51,7 +52,7 @@ struct asyncmsg_dev {
     struct cdev cdev;
 
     struct kmem_cache *asyncmsg_cache;
-    mempool_t *asyncmsg_mempool; 
+    mempool_t *asyncmsg_mempool;
 
     struct semaphore sem;
     spinlock_t lock;
